@@ -32,7 +32,7 @@
     margin-bottom: 12px; border-right: 4px solid #38bdf8;
     cursor: pointer; transition: 0.2s; position: relative;
   }
-  .match:hover { background: #243449; transform: translateX(-2px); }
+  .match:hover { background: #243449; }
   .match.favorite { border-right-color: #fbbf24; }
   .fav-btn {
     position: absolute; top: 12px; left: 12px;
@@ -200,38 +200,15 @@ const teamNames = {
   'AFC Ajax': 'أياكس', 'PSV Eindhoven': 'آيندهوفن', 'Feyenoord Rotterdam': 'فينورد'
 };
 
-const translationCache = {};
-
-async function autoTranslate(text) {
-  if (!text) return text;
-  if (teamNames[text]) return teamNames[text];
-  if (translationCache[text]) return translationCache[text];
-  try {
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=en|ar`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const translated = data.responseData?.translatedText || text;
-    translationCache[text] = translated;
-    return translated;
-  } catch { return text; }
-}
-
-async function translateTeamAuto(name) {
-  return teamNames[name] || await autoTranslate(name);
-}
-
-async function translateLeagueAuto(name) {
-  return leagueNames[name] || await autoTranslate(name);
-}
+function translateTeam(name) { return teamNames[name] || name; }
+function translateLeague(name) { return leagueNames[name] || name; }
 
 function getFavorites() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
   catch { return []; }
 }
-
-function saveFavorites(favs) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(favs));
-}
+function saveFavorites(favs) { localStorage.setItem(STORAGE_KEY, JSON.stringify(favs)); }
+function isFavorite(name) { return getFavorites().includes(name); }
 
 function toggleFavorite(teamName, event) {
   event.stopPropagation();
@@ -243,23 +220,16 @@ function toggleFavorite(teamName, event) {
   loadMatches(currentFilter);
 }
 
-function isFavorite(teamName) {
-  return getFavorites().includes(teamName);
-}
-
-function notificationsEnabled() {
-  return localStorage.getItem(NOTIF_KEY) === 'true';
-}
+function notificationsEnabled() { return localStorage.getItem(NOTIF_KEY) === 'true'; }
 
 async function toggleNotifications() {
   if (!notificationsEnabled()) {
+    if (!('Notification' in window)) { alert('المتصفح لا يدعم الإشعارات'); return; }
     const perm = await Notification.requestPermission();
     if (perm === 'granted') {
       localStorage.setItem(NOTIF_KEY, 'true');
       updateNotifUI();
       startNotificationLoop();
-    } else {
-      alert('تم رفض الإشعارات من المتصفح');
     }
   } else {
     localStorage.setItem(NOTIF_KEY, 'false');
@@ -277,16 +247,12 @@ function getNotified() {
   try { return JSON.parse(localStorage.getItem(NOTIFIED_KEY)) || []; }
   catch { return []; }
 }
-
 function markNotified(id) {
   const list = getNotified();
   list.push(id);
   localStorage.setItem(NOTIFIED_KEY, JSON.stringify(list.slice(-100)));
 }
-
-function wasNotified(id) {
-  return getNotified().includes(id);
-}
+function wasNotified(id) { return getNotified().includes(id); }
 
 async function checkFavoritesNotifications() {
   if (!notificationsEnabled()) return;
@@ -301,21 +267,18 @@ async function checkFavoritesNotifications() {
     const data = await res.json();
     (data.matches || []).forEach(match => {
       if (wasNotified(match.id)) return;
-      const homeFav = favs.includes(match.homeTeam.name);
-      const awayFav = favs.includes(match.awayTeam.name);
-      if (!homeFav && !awayFav) return;
-      const matchTime = new Date(match.utcDate).getTime();
-      const diffMinutes = (matchTime - Date.now()) / 60000;
+      if (!favs.includes(match.homeTeam.name) && !favs.includes(match.awayTeam.name)) return;
+      const diffMinutes = (new Date(match.utcDate).getTime() - Date.now()) / 60000;
       if (diffMinutes > 0 && diffMinutes < 30) {
-        const home = teamNames[match.homeTeam.name] || match.homeTeam.name;
-        const away = teamNames[match.awayTeam.name] || match.awayTeam.name;
+        const home = translateTeam(match.homeTeam.name);
+        const away = translateTeam(match.awayTeam.name);
         new Notification('⚽ مباراة قريبة', {
           body: `${home} × ${away} خلال ${Math.round(diffMinutes)} دقيقة`
         });
         markNotified(match.id);
       }
     });
-  } catch {}
+  } catch (e) { console.log(e); }
 }
 
 let notifInterval = null;
@@ -324,6 +287,79 @@ function startNotificationLoop() {
   if (!notificationsEnabled()) return;
   checkFavoritesNotifications();
   notifInterval = setInterval(checkFavoritesNotifications, 5 * 60 * 1000);
+}
+
+let currentFilter = 'TODAY';
+
+async function apiFetch(url) {
+  const res = await fetch(url, { headers: { 'X-Auth-Token': API_TOKEN } });
+  if (!res.ok) {
+    if (res.status === 429) throw new Error('تجاوزت الحد (10 طلبات/دقيقة). انتظر دقيقة.');
+    if (res.status === 403) throw new Error('المفتاح غير صالح أو منتهي.');
+    if (res.status === 404) throw new Error('غير موجود.');
+    throw new Error('خطأ في الاتصال: ' + res.status);
+  }
+  return res.json();
+}
+
+async function loadMatches(filter) {
+  currentFilter = filter;
+  Object.keys(buttons).forEach(key => buttons[key].classList.toggle('active', key === filter));
+  content.className = 'status';
+  content.textContent = 'جاري التحميل...';
+
+  const today = new Date();
+  let dateFrom = new Date(today);
+  let dateTo = new Date(today);
+  if (filter === 'WEEK') dateTo.setDate(today.getDate() + 7);
+
+  const fmt = d => d.toISOString().split('T')[0];
+  const url = `https://api.football-data.org/v4/matches?dateFrom=${fmt(dateFrom)}&dateTo=${fmt(dateTo)}`;
+
+  try {
+    const data = await apiFetch(url);
+    renderMatches(data.matches || []);
+  } catch (err) {
+    content.className = 'status error';
+    content.textContent = '❌ ' + err.message;
+  }
+}
+
+function renderMatches(matches) {
+  if (matches.length === 0) {
+    content.className = 'status';
+    content.textContent = 'لا توجد مباريات في هذه الفترة';
+    return;
+  }
+  content.className = '';
+  content.innerHTML = matches.map(match => {
+    const home = translateTeam(match.homeTeam.name);
+    const away = translateTeam(match.awayTeam.name);
+    const league = translateLeague(match.competition.name);
+    const hs = match.score.fullTime.home;
+    const as = match.score.fullTime.away;
+    const scoreText = (hs !== null && as !== null) ? `${hs} - ${as}` : 'VS';
+    const isFav = isFavorite(match.homeTeam.name) || isFavorite(match.awayTeam.name);
+    return `
+      <div class="match ${isFav ? 'favorite' : ''}" onclick="openMatchDetails(${match.id})">
+        <button class="fav-btn ${isFav ? 'active' : ''}"
+                onclick="toggleFavorite('${match.homeTeam.name.replace(/'/g, "\\'")}', event)">★</button>
+        <div class="league">${league}</div>
+        <div class="teams">
+          <div class="team home">${home}</div>
+          <div class="score">${scoreText}</div>
+          <div class="team away">${away}</div>
+        </div>
+        <div class="time">${formatTime(match.utcDate)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function formatTime(utcDate) {
+  return new Date(utcDate).toLocaleString('ar-EG', {
+    weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: true
+  });
 }
 
 async function loadFavorites() {
@@ -343,8 +379,7 @@ async function loadFavorites() {
   const fmt = d => d.toISOString().split('T')[0];
   const url = `https://api.football-data.org/v4/matches?dateFrom=${fmt(dateFrom)}&dateTo=${fmt(dateTo)}`;
   try {
-    const res = await fetch(url, { headers: { 'X-Auth-Token': API_TOKEN } });
-    const data = await res.json();
+    const data = await apiFetch(url);
     const filtered = (data.matches || []).filter(m =>
       favs.includes(m.homeTeam.name) || favs.includes(m.awayTeam.name)
     );
@@ -353,138 +388,69 @@ async function loadFavorites() {
       content.textContent = 'لا توجد مباريات قادمة لفرقك المفضلة';
       return;
     }
-    await renderMatches(filtered);
+    renderMatches(filtered);
   } catch (err) {
     content.className = 'status error';
     content.textContent = '❌ ' + err.message;
   }
-}
-
-let currentFilter = 'TODAY';
-
-async function loadMatches(filter) {
-  currentFilter = filter;
-  Object.keys(buttons).forEach(key => buttons[key].classList.toggle('active', key === filter));
-  content.className = 'status';
-  content.textContent = 'جاري التحميل...';
-  const today = new Date();
-  let dateFrom = new Date(today);
-  let dateTo = new Date(today);
-  if (filter === 'WEEK') dateTo.setDate(today.getDate() + 7);
-  const fmt = d => d.toISOString().split('T')[0];
-  const url = `https://api.football-data.org/v4/matches?dateFrom=${fmt(dateFrom)}&dateTo=${fmt(dateTo)}`;
-  try {
-    const response = await fetch(url, { headers: { 'X-Auth-Token': API_TOKEN } });
-    if (!response.ok) {
-      if (response.status === 429) throw new Error('تجاوزت الحد (10 طلبات/دقيقة). انتظر دقيقة.');
-      if (response.status === 403) throw new Error('المفتاح غير صالح.');
-      throw new Error('خطأ: ' + response.status);
-    }
-    const data = await response.json();
-    await renderMatches(data.matches || []);
-  } catch (err) {
-    content.className = 'status error';
-    content.textContent = '❌ ' + err.message;
-  }
-}
-
-async function renderMatches(matches) {
-  if (matches.length === 0) {
-    content.className = 'status';
-    content.textContent = 'لا توجد مباريات في هذه الفترة';
-    return;
-  }
-  content.className = 'status';
-  content.textContent = 'جاري ترجمة الأسماء...';
-  const cards = [];
-  for (const match of matches) {
-    const home = await translateTeamAuto(match.homeTeam.name);
-    const away = await translateTeamAuto(match.awayTeam.name);
-    const league = await translateLeagueAuto(match.competition.name);
-    const homeScore = match.score.fullTime.home;
-    const awayScore = match.score.fullTime.away;
-    const scoreText = (homeScore !== null && awayScore !== null) ? `${homeScore} - ${awayScore}` : 'VS';
-    const isFav = isFavorite(match.homeTeam.name) || isFavorite(match.awayTeam.name);
-    cards.push(`
-      <div class="match ${isFav ? 'favorite' : ''}" onclick="openMatchDetails(${match.id})">
-        <button class="fav-btn ${isFav ? 'active' : ''}"
-                onclick="toggleFavorite('${match.homeTeam.name.replace(/'/g, "\\'")}', event)">★</button>
-        <div class="league">${league}</div>
-        <div class="teams">
-          <div class="team home">${home}</div>
-          <div class="score">${scoreText}</div>
-          <div class="team away">${away}</div>
-        </div>
-        <div class="time">${formatTime(match.utcDate)}</div>
-      </div>
-    `);
-  }
-  content.className = '';
-  content.innerHTML = cards.join('');
-}
-
-function formatTime(utcDate) {
-  return new Date(utcDate).toLocaleString('ar-EG', {
-    weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: true
-  });
 }
 
 async function openMatchDetails(matchId) {
   modal.classList.add('open');
   modalBody.innerHTML = '<div class="spinner">جاري التحميل...</div>';
   try {
-    const res = await fetch(`https://api.football-data.org/v4/matches/${matchId}`, {
-      headers: { 'X-Auth-Token': API_TOKEN }
-    });
-    if (!res.ok) throw new Error('فشل تحميل التفاصيل');
-    const match = await res.json();
-    await renderMatchDetails(match);
+    const match = await apiFetch(`https://api.football-data.org/v4/matches/${matchId}`);
+    renderMatchDetails(match);
   } catch (err) {
     modalBody.innerHTML = `<div class="error">❌ ${err.message}</div>`;
   }
 }
 
-async function renderMatchDetails(match) {
-  const home = await translateTeamAuto(match.homeTeam.name);
-  const away = await translateTeamAuto(match.awayTeam.name);
-  const league = await translateLeagueAuto(match.competition.name);
-  const homeScore = match.score.fullTime.home ?? '-';
-  const awayScore = match.score.fullTime.away ?? '-';
+function renderMatchDetails(match) {
+  const home = translateTeam(match.homeTeam.name);
+  const away = translateTeam(match.awayTeam.name);
+  const league = translateLeague(match.competition.name);
+  const hs = match.score.fullTime.home ?? '-';
+  const as = match.score.fullTime.away ?? '-';
+
   let html = `
-    <h2>${home} ${homeScore} - ${awayScore} ${away}</h2>
+    <h2>${home} ${hs} - ${as} ${away}</h2>
     <div style="text-align:center;color:#94a3b8;font-size:13px;margin-bottom:8px">${league}</div>
     <div style="text-align:center;color:#94a3b8;font-size:13px">${formatTime(match.utcDate)}</div>
   `;
+
   const goals = match.goals || [];
   if (goals.length > 0) {
     html += '<div class="section-title">⚽ الأهداف</div>';
-    for (const g of goals) {
+    goals.forEach(g => {
       const scorer = g.scorer?.name || 'غير معروف';
       const team = g.team?.name === match.homeTeam.name ? home : away;
-      const minute = g.minute || '?';
       const type = g.type === 'PENALTY' ? ' (ركلة جزاء)' : g.type === 'OWN_GOAL' ? ' (هدف عكسي)' : '';
-      html += `<div class="goal-row"><span class="minute">${minute}'</span><span>${scorer}${type}</span><span style="color:#94a3b8">${team}</span></div>`;
-    }
+      html += `<div class="goal-row"><span class="minute">${g.minute || '?'}'</span><span>${scorer}${type}</span><span style="color:#94a3b8">${team}</span></div>`;
+    });
   }
+
   const bookings = match.bookings || [];
   if (bookings.length > 0) {
     html += '<div class="section-title">🟨 البطاقات</div>';
-    for (const b of bookings) {
+    bookings.forEach(b => {
       const player = b.player?.name || 'غير معروف';
       const team = b.team?.name === match.homeTeam.name ? home : away;
-      const minute = b.minute || '?';
       const cardLabel = b.card === 'RED' ? '🟥' : b.card === 'YELLOW_RED' ? '🟨🟥' : '🟨';
-      html += `<div class="card-row"><span class="minute">${minute}'</span><span>${cardLabel} ${player}</span><span style="color:#94a3b8">${team}</span></div>`;
-    }
+      html += `<div class="card-row"><span class="minute">${b.minute || '?'}'</span><span>${cardLabel} ${player}</span><span style="color:#94a3b8">${team}</span></div>`;
+    });
   }
+
   if (match.homeTeam.lineup?.length) {
     html += '<div class="section-title">👥 التشكيل</div>';
     html += `<div style="font-size:13px;line-height:1.8"><div style="color:#38bdf8;font-weight:bold">${home}</div>${match.homeTeam.lineup.map(p => p.name).join(' · ')}</div>`;
     html += `<div style="font-size:13px;line-height:1.8;margin-top:8px"><div style="color:#38bdf8;font-weight:bold">${away}</div>${match.awayTeam.lineup.map(p => p.name).join(' · ')}</div>`;
   }
+
   if (!goals.length && !bookings.length && !match.homeTeam.lineup) {
     html += '<div style="text-align:center;color:#94a3b8;padding:20px">لا توجد تفاصيل متاحة</div>';
   }
+
   modalBody.innerHTML = html;
 }
 
@@ -508,4 +474,24 @@ function openStandings() {
   `;
 }
 
-a
+async function loadStandings(code) {
+  const container = document.getElementById('standings-content');
+  if (!code) { container.innerHTML = ''; return; }
+  container.innerHTML = '<div class="spinner">جاري التحميل...</div>';
+  try {
+    const data = await apiFetch(`https://api.football-data.org/v4/competitions/${code}/standings`);
+    const table = data.standings?.find(s => s.type === 'TOTAL');
+    if (!table) { container.innerHTML = '<div class="status">لا يوجد ترتيب</div>'; return; }
+    let html = `<table class="standings-table"><thead><tr>
+      <th>#</th><th style="text-align:right">الفريق</th><th>لعب</th>
+      <th>ف</th><th>ت</th><th>خ</th><th>له</th><th>عليه</th><th>+/-</th><th>نقاط</th>
+    </tr></thead><tbody>`;
+    table.table.forEach(row => {
+      html += `<tr>
+        <td class="pos">${row.position}</td>
+        <td class="name">${translateTeam(row.team.name)}</td>
+        <td>${row.playedGames}</td>
+        <td>${row.won}</td><td>${row.draw}</td><td>${row.lost}</td>
+        <td>${row.goalsFor}</td><td>${row.goalsAgainst}</td>
+        <td>${row.goalDifference > 0 ? '+' : ''}${row.goalDifference}</td>
+   
